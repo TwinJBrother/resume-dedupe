@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 using Episode = MediaBrowser.Controller.Entities.TV.Episode;
 
 namespace Jellyfin.Plugin.ResumeDedupe;
@@ -20,7 +21,7 @@ namespace Jellyfin.Plugin.ResumeDedupe;
 /// Next Up (/Shows/NextUp, so a home):
 ///   esconde as series que ja tem episodio em andamento (ja aparecem em Continue Watching).
 ///
-/// Como funciona (v1.2):
+/// Como funciona (v1.3):
 ///  - Filtro MVC: trabalha com objetos, nunca com bytes (gzip/brotli/proxy nao interferem).
 ///  - O Next Up NAO depende mais do pedido de Continue Watching: o plugin consulta o
 ///    servidor direto (mesma consulta que o Continue Watching usa, so os IDs das series),
@@ -28,6 +29,8 @@ namespace Jellyfin.Plugin.ResumeDedupe;
 ///  - Paginas exatas: a mesma consulta diz quantos itens serao removidos, entao o plugin
 ///    pede ao Jellyfin so o necessario (limite + removidos) e a linha vem sempre cheia.
 ///    Sem duplicatas, nao amplia nada e nao gasta nada extra.
+///  - Filtro singleton com caminho rapido sincrono: pedidos que nao sao Resume/NextUp passam sem custo.
+///  - Identidade vem do token; pedido para outro usuario nao e alterado.
 ///  - Qualquer erro devolve a resposta original do Jellyfin.
 /// </summary>
 public class ResumeDedupeFilter : IAsyncActionFilter
@@ -86,29 +89,43 @@ public class ResumeDedupeFilter : IAsyncActionFilter
         public Lazy<Dictionary<Guid, int>?> Counts { get; }
     }
 
-    public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
+    public Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
     {
-        var kind = Kind.None;
+        // Filtro global: roda em TODA acao da API (imagens, HLS, etc.). Para tudo que nao e
+        // Resume/NextUp, devolve next() direto: sem maquina de estado async, sem alocacao.
+        Kind kind;
+        try
+        {
+            kind = Classify(context.HttpContext.Request);
+        }
+        catch
+        {
+            kind = Kind.None;
+        }
+
+        return kind == Kind.None ? next() : RunAsync(context, next, kind);
+    }
+
+    private async Task RunAsync(ActionExecutingContext context, ActionExecutionDelegate next, Kind kind)
+    {
         var plan = default(Plan);
         var cfg = GetConfig();
 
         try
         {
-            kind = Classify(context.HttpContext.Request);
-            if (kind != Kind.None)
-            {
-                var enabled = kind == Kind.Resume
-                    ? cfg.DedupeContinueWatching
-                    : cfg.HideNextUpInContinueWatching;
+            var enabled = kind == Kind.Resume
+                ? cfg.DedupeContinueWatching
+                : cfg.HideNextUpInContinueWatching;
 
-                if (!enabled)
-                {
-                    kind = Kind.None;
-                }
-                else
-                {
-                    plan = Prepare(context, kind, cfg, GetUserId(context));
-                }
+            if (!enabled
+                || (kind == Kind.Resume && !WantsEpisodes(context.HttpContext.Request))
+                || !TryGetUserId(context, out var userId))
+            {
+                kind = Kind.None;
+            }
+            else
+            {
+                plan = Prepare(context, kind, cfg, userId);
             }
         }
         catch (Exception ex)
@@ -166,6 +183,11 @@ public class ResumeDedupeFilter : IAsyncActionFilter
         var start = Math.Max(0, ReadInt(args, "startIndex") ?? 0);
         var limit = ReadInt(args, "limit");
 
+        if (kind == Kind.Resume && (limit is <= 0 || (start == 0 && limit is null)))
+        {
+            return new Plan(start, limit, false, 0, null); // nada a ampliar: sem consulta extra
+        }
+
         var counts = userId == Guid.Empty ? null : GetResumeCounts(userId);
 
         HashSet<Guid>? hidden = null;
@@ -185,7 +207,7 @@ public class ResumeDedupeFilter : IAsyncActionFilter
         }
         else
         {
-            var max = Math.Max(1, cfg.MaxEpisodesPerSeries);
+            var max = MaxPerSeries(cfg);
             foreach (var count in counts.Values)
             {
                 if (count > max)
@@ -237,11 +259,17 @@ public class ResumeDedupeFilter : IAsyncActionFilter
     private Dictionary<Guid, int>? GetResumeCounts(Guid userId)
     {
         var now = Environment.TickCount64;
+        if (Cache.TryGetValue(userId, out var hit) && now - hit.At <= CacheTtlMs)
+        {
+            return hit.Counts.Value;
+        }
+
         var entry = Cache.AddOrUpdate(
             userId,
             _ => new CacheEntry(now, () => LoadResumeCounts(userId)),
             (_, old) => now - old.At > CacheTtlMs ? new CacheEntry(now, () => LoadResumeCounts(userId)) : old);
 
+        // Count de ConcurrentDictionary e caro: so consultamos ao criar/renovar uma entrada.
         if (Cache.Count > CachePruneAbove)
         {
             Prune(now);
@@ -309,14 +337,74 @@ public class ResumeDedupeFilter : IAsyncActionFilter
                 Cache.TryRemove(pair.Key, out _);
             }
         }
+
+        if (Cache.Count > CachePruneAbove * 4)
+        {
+            Cache.Clear(); // teto duro: o cache e so uma otimizacao, pode recomecar
+        }
     }
+
+    /// <summary>
+    /// Resume de audio/livros (mediaTypes sem Video), so filmes, ou busca: nao ha o que deduplicar por serie.
+    /// Pular evita ampliar a consulta e a consulta de contagem a toa.
+    /// </summary>
+    private static bool WantsEpisodes(HttpRequest request)
+    {
+        var query = request.Query;
+
+        if (query.TryGetValue("searchTerm", out var term) && HasAny(term))
+        {
+            return false;
+        }
+
+        if (query.TryGetValue("mediaTypes", out var media) && HasAny(media) && !Mentions(media, "Video"))
+        {
+            return false;
+        }
+
+        if (query.TryGetValue("includeItemTypes", out var include) && HasAny(include)
+            && !Mentions(include, "Episode") && !Mentions(include, "Series") && !Mentions(include, "Season"))
+        {
+            return false;
+        }
+
+        return !(query.TryGetValue("excludeItemTypes", out var exclude) && Mentions(exclude, "Episode"));
+    }
+
+    private static bool HasAny(StringValues values)
+    {
+        foreach (var value in values)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool Mentions(StringValues values, string token)
+    {
+        foreach (var value in values)
+        {
+            if (value is not null && value.Contains(token, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static int MaxPerSeries(PluginConfiguration cfg) => Math.Clamp(cfg.MaxEpisodesPerSeries, 1, 10);
 
     // -------------------------------------------------------- CONTINUE WATCHING
 
     private void ProcessResume(ObjectResult holder, QueryResult<BaseItemDto> result, PluginConfiguration cfg, Plan plan)
     {
         var raw = result.Items?.ToList() ?? new List<BaseItemDto>();
-        var deduped = Dedupe(raw, Math.Max(1, cfg.MaxEpisodesPerSeries));
+        var deduped = Dedupe(raw, MaxPerSeries(cfg));
         var page = Slice(deduped, plan);
 
         Publish(holder, result, raw.Count, deduped.Count, page, plan);
@@ -368,6 +456,20 @@ public class ResumeDedupeFilter : IAsyncActionFilter
         return false;
     }
 
+    /// <summary>Chave da serie a que o item pertence (Guid.Empty = nao agrupa: filmes, musicas...).</summary>
+    private static Guid KeyOf(BaseItemDto item)
+    {
+        // Episodio/temporada contam para a sua serie; um item "Series" (o Jellyfin 12.x pode devolver
+        // a serie inteira em Continue Watching) conta para ela mesma.
+        if (item.Type is BaseItemKind.Episode or BaseItemKind.Season
+            && item.SeriesId is { } seriesId && seriesId != Guid.Empty)
+        {
+            return seriesId;
+        }
+
+        return item.Type == BaseItemKind.Series ? item.Id : Guid.Empty;
+    }
+
     private static List<BaseItemDto> Dedupe(IEnumerable<BaseItemDto> items, int maxPerSeries)
     {
         var ids = new HashSet<Guid>();
@@ -387,23 +489,14 @@ public class ResumeDedupeFilter : IAsyncActionFilter
                 continue;
             }
 
-            // Episodio conta para a sua serie; um item "Series" (o Jellyfin 12.x pode devolver
-            // a serie inteira em Continue Watching) conta para ela mesma.
-            var key = Guid.Empty;
-            if (item.Type == BaseItemKind.Episode && item.SeriesId is { } seriesId && seriesId != Guid.Empty)
-            {
-                key = seriesId;
-            }
-            else if (item.Type == BaseItemKind.Series && item.Id != Guid.Empty)
-            {
-                key = item.Id;
-            }
-
+            var key = KeyOf(item);
             if (key != Guid.Empty)
             {
                 counts.TryGetValue(key, out var count);
                 if (count >= maxPerSeries)
                 {
+                    // O Jellyfin ja ordena por data de reproducao; isto so protege se a ordem vier diferente.
+                    TryPromote(kept, key, item);
                     continue;
                 }
 
@@ -414,6 +507,37 @@ public class ResumeDedupeFilter : IAsyncActionFilter
         }
 
         return kept;
+    }
+
+    /// <summary>Se o item descartado foi reproduzido depois de um mantido da mesma serie, troca os dois.</summary>
+    private static void TryPromote(List<BaseItemDto> kept, Guid key, BaseItemDto item)
+    {
+        if (item.UserData?.LastPlayedDate is not { } newer)
+        {
+            return;
+        }
+
+        var worst = -1;
+        var worstDate = DateTime.MaxValue;
+        for (var i = 0; i < kept.Count; i++)
+        {
+            if (KeyOf(kept[i]) != key)
+            {
+                continue;
+            }
+
+            var date = kept[i].UserData?.LastPlayedDate ?? DateTime.MinValue;
+            if (date < worstDate)
+            {
+                worstDate = date;
+                worst = i;
+            }
+        }
+
+        if (worst >= 0 && newer > worstDate)
+        {
+            kept[worst] = item;
+        }
     }
 
     private static List<BaseItemDto> Slice(List<BaseItemDto> deduped, Plan plan)
@@ -524,14 +648,17 @@ public class ResumeDedupeFilter : IAsyncActionFilter
             return Kind.None;
         }
 
-        if (path.EndsWith("/Items/Resume", StringComparison.OrdinalIgnoreCase)
-            || path.EndsWith("/UserItems/Resume", StringComparison.OrdinalIgnoreCase))
+        // Quase todo pedido da API termina aqui na primeira checagem.
+        if (path.EndsWith("/Resume", StringComparison.OrdinalIgnoreCase)
+            && (path.EndsWith("/Items/Resume", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith("/UserItems/Resume", StringComparison.OrdinalIgnoreCase)))
         {
             return Kind.Resume;
         }
 
         // Next Up de uma serie especifica (pagina da serie) nao entra.
-        if (path.EndsWith("/Shows/NextUp", StringComparison.OrdinalIgnoreCase)
+        if (path.EndsWith("/NextUp", StringComparison.OrdinalIgnoreCase)
+            && path.EndsWith("/Shows/NextUp", StringComparison.OrdinalIgnoreCase)
             && !request.Query.ContainsKey("seriesId"))
         {
             return Kind.NextUp;
@@ -540,21 +667,48 @@ public class ResumeDedupeFilter : IAsyncActionFilter
         return Kind.None;
     }
 
-    private static Guid GetUserId(ActionExecutingContext context)
+    /// <summary>
+    /// Usuario cujo pedido estamos ajustando. O token autenticado manda; se o pedido nomeia outro
+    /// usuario (admin vendo outra conta), nao mexemos. Com chave de API (sem claim) vale o userId do pedido.
+    /// </summary>
+    private static bool TryGetUserId(ActionExecutingContext context, out Guid userId)
     {
         var http = context.HttpContext;
-        string? raw = http.User.FindFirst("Jellyfin-UserId")?.Value;
+        _ = Guid.TryParse(http.User.FindFirst("Jellyfin-UserId")?.Value, out var claim);
 
-        if (raw is null && context.ActionArguments.TryGetValue("userId", out var arg))
+        Guid requested = Guid.Empty;
+        if (context.ActionArguments.TryGetValue("userId", out var arg))
         {
-            raw = arg?.ToString();
+            requested = ToGuid(arg);
         }
 
-        raw ??= http.Request.Query["userId"].FirstOrDefault()
-            ?? http.Request.RouteValues["userId"]?.ToString();
+        if (requested == Guid.Empty)
+        {
+            requested = ToGuid(http.Request.RouteValues["userId"]);
+        }
 
-        return Guid.TryParse(raw, out var id) ? id : Guid.Empty;
+        if (requested == Guid.Empty && http.Request.Query.TryGetValue("userId", out var q))
+        {
+            requested = ToGuid(q.FirstOrDefault());
+        }
+
+        if (claim != Guid.Empty)
+        {
+            userId = claim;
+            return requested == Guid.Empty || requested == claim;
+        }
+
+        userId = requested;
+        return requested != Guid.Empty;
     }
+
+    private static Guid ToGuid(object? value) => value switch
+    {
+        Guid g => g,
+        string s when Guid.TryParse(s, out var parsed) => parsed,
+        null => Guid.Empty,
+        _ => Guid.TryParse(value.ToString(), out var other) ? other : Guid.Empty
+    };
 
     private static PluginConfiguration GetConfig()
         => Plugin.Instance?.Configuration ?? new PluginConfiguration();

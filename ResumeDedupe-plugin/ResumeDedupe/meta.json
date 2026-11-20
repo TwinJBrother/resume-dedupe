@@ -7,7 +7,7 @@
   "owner": "local",
   "targetAbi": "12.0.0.0",
   "timestamp": "2026-11-20T00:00:00Z",
-  "version": "1.2.0.0",
+  "version": "1.3.1.0",
   "status": "Active",
   "autoUpdate": false,
   "assemblies": [ "Jellyfin.Plugin.ResumeDedupe.dll" ]

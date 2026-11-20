@@ -9,8 +9,9 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
 {
     public void RegisterServices(IServiceCollection serviceCollection, IServerApplicationHost applicationHost)
     {
-        // Filtro MVC global. Os plugins sao registrados antes do AddMvc do servidor,
-        // entao Configure<MvcOptions> se combina com as opcoes do Jellyfin.
-        serviceCollection.Configure<MvcOptions>(options => options.Filters.Add<ResumeDedupeFilter>());
+        // Singleton + AddService: uma unica instancia. Filters.Add<T>() criaria o filtro
+        // (com 3 resolucoes de DI) a cada pedido de QUALQUER endpoint da API.
+        serviceCollection.AddSingleton<ResumeDedupeFilter>();
+        serviceCollection.Configure<MvcOptions>(options => options.Filters.AddService<ResumeDedupeFilter>());
     }
 }

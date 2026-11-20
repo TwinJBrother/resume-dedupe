@@ -53,7 +53,7 @@
             ApiClient.getPluginConfiguration(ResumeDedupeConfig.pluginUniqueId).then(function (config) {
                 config.DedupeContinueWatching = document.querySelector('#chkDedupe').checked;
                 config.HideNextUpInContinueWatching = document.querySelector('#chkNextUp').checked;
-                config.MaxEpisodesPerSeries = Math.max(1, parseInt(document.querySelector('#txtMax').value, 10) || 1);
+                config.MaxEpisodesPerSeries = Math.min(10, Math.max(1, parseInt(document.querySelector('#txtMax').value, 10) || 1));
                 ApiClient.updatePluginConfiguration(ResumeDedupeConfig.pluginUniqueId, config).then(Dashboard.processPluginConfigurationUpdateResult);
             });
             e.preventDefault();
