@@ -3,6 +3,8 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,15 +16,40 @@ jobs:
       - name: Publish
         run: |
           CSPROJ=$(find . -name ResumeDedupe.csproj | head -n 1)
-          echo "Projeto: $CSPROJ"
           dotnet publish "$CSPROJ" -c Release -o out
-      - name: Package
+      - name: Package and manifest
         run: |
           META=$(find . -name meta.json -path '*ResumeDedupe*' | head -n 1)
-          mkdir -p pkg/ResumeDedupe_1.1.0.0
-          cp out/Jellyfin.Plugin.ResumeDedupe.dll pkg/ResumeDedupe_1.1.0.0/
-          cp "$META" pkg/ResumeDedupe_1.1.0.0/
-      - uses: actions/upload-artifact@v4
+          VER=$(jq -r '.version // "1.1.0.0"' "$META")
+          echo "VER=$VER" >> $GITHUB_ENV
+          mkdir pkg
+          cp out/Jellyfin.Plugin.ResumeDedupe.dll pkg/
+          cp "$META" pkg/
+          (cd pkg && zip ../ResumeDedupe_$VER.zip *)
+          SUM=$(md5sum ResumeDedupe_$VER.zip | cut -d' ' -f1)
+          URL="https://github.com/${{ github.repository }}/releases/download/v$VER/ResumeDedupe_$VER.zip"
+          jq -n --slurpfile m "$META" --arg ver "$VER" --arg sum "$SUM" --arg url "$URL" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{
+              guid: $m[0].guid,
+              name: ($m[0].name // "Resume Dedupe"),
+              description: ($m[0].description // "Deduplicates Continue Watching and Next Up"),
+              overview: ($m[0].overview // "Deduplicates Continue Watching and Next Up"),
+              owner: ($m[0].owner // "TwinJBrother"),
+              category: "General",
+              imageUrl: "",
+              versions: [{
+                version: $ver,
+                changelog: "Release",
+                targetAbi: ($m[0].targetAbi // "12.0.0.0"),
+                sourceUrl: $url,
+                checksum: $sum,
+                timestamp: $ts
+              }]
+            }]' > manifest.json
+          cat manifest.json
+      - uses: softprops/action-gh-release@v2
         with:
-          name: ResumeDedupe_1.1.0.0
-          path: pkg
+          tag_name: v${{ env.VER }}
+          files: |
+            ResumeDedupe_${{ env.VER }}.zip
+            manifest.json
