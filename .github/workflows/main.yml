@@ -5,27 +5,38 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+      - name: Check version
+        run: |
+          CSPROJ=$(find . -name ResumeDedupe.csproj | head -n 1)
+          META=$(find . -name meta.json -path '*ResumeDedupe*' | head -n 1)
+          V1=$(grep -oPm1 '(?<=<Version>)[^<]+' "$CSPROJ")
+          V2=$(jq -r '.version' "$META")
+          echo "csproj=$V1 meta=$V2"
+          [ "$V1" = "$V2" ] || { echo "::error::Versao diferente entre csproj e meta.json"; exit 1; }
+          echo "VER=$V1" >> $GITHUB_ENV
       - name: Publish
         run: |
           CSPROJ=$(find . -name ResumeDedupe.csproj | head -n 1)
-          dotnet publish "$CSPROJ" -c Release -o out
+          dotnet publish "$CSPROJ" -c Release -o out --nologo -p:DebugType=none -p:ContinuousIntegrationBuild=true
       - name: Package and manifest
         run: |
           META=$(find . -name meta.json -path '*ResumeDedupe*' | head -n 1)
-          VER=$(jq -r '.version // "1.2.0.0"' "$META")
-          echo "VER=$VER" >> $GITHUB_ENV
           mkdir pkg
           cp out/Jellyfin.Plugin.ResumeDedupe.dll pkg/
           cp "$META" pkg/
-          (cd pkg && zip ../ResumeDedupe_$VER.zip *)
+          (cd pkg && zip -X ../ResumeDedupe_$VER.zip *)
           SUM=$(md5sum ResumeDedupe_$VER.zip | cut -d' ' -f1)
           URL="https://github.com/${{ github.repository }}/releases/download/v$VER/ResumeDedupe_$VER.zip"
           jq -n --slurpfile m "$META" --arg ver "$VER" --arg sum "$SUM" --arg url "$URL" \
@@ -34,7 +45,7 @@ jobs:
               name: ($m[0].name // "Resume Dedupe"),
               description: ($m[0].description // "Deduplicates Continue Watching and Next Up"),
               overview: ($m[0].overview // "Deduplicates Continue Watching and Next Up"),
-              owner: ($m[0].owner // "TwinJBrother"),
+              owner: ($m[0].owner // "local"),
               category: "General",
               imageUrl: "",
               versions: [{
