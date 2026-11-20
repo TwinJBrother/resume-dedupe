@@ -20,7 +20,7 @@ jobs:
       - name: Package and manifest
         run: |
           META=$(find . -name meta.json -path '*ResumeDedupe*' | head -n 1)
-          VER=$(jq -r '.version // "1.1.0.0"' "$META")
+          VER=$(jq -r '.version // "1.2.0.0"' "$META")
           echo "VER=$VER" >> $GITHUB_ENV
           mkdir pkg
           cp out/Jellyfin.Plugin.ResumeDedupe.dll pkg/
