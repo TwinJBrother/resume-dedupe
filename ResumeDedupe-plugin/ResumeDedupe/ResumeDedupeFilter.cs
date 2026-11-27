@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using Jellyfin.Data.Enums;
-using Jellyfin.Plugin.ResumeDedupe.Configuration;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
@@ -9,135 +8,87 @@ using MediaBrowser.Model.Querying;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Primitives;
 using Episode = MediaBrowser.Controller.Entities.TV.Episode;
 
 namespace Jellyfin.Plugin.ResumeDedupe;
 
 /// <summary>
-/// Continue Watching (/UserItems/Resume, /Users/{id}/Items/Resume):
-///   um (ou N) item(ns) por serie, o mais recente primeiro.
-/// Next Up (/Shows/NextUp, so a home):
-///   esconde as series que ja tem episodio em andamento (ja aparecem em Continue Watching).
+/// Continue Watching (/UserItems/Resume): um episodio por serie, o mais recente primeiro.
+/// Next Up (/Shows/NextUp): esconde series que ja tem episodio em andamento.
 ///
-/// Como funciona (v1.3):
-///  - Filtro MVC: trabalha com objetos, nunca com bytes (gzip/brotli/proxy nao interferem).
-///  - O Next Up NAO depende mais do pedido de Continue Watching: o plugin consulta o
-///    servidor direto (mesma consulta que o Continue Watching usa, so os IDs das series),
-///    com cache de 2 s por usuario. Sem espera, sem corrida entre pedidos.
-///  - Paginas exatas: a mesma consulta diz quantos itens serao removidos, entao o plugin
-///    pede ao Jellyfin so o necessario (limite + removidos) e a linha vem sempre cheia.
-///    Sem duplicatas, nao amplia nada e nao gasta nada extra.
-///  - Filtro singleton com caminho rapido sincrono: pedidos que nao sao Resume/NextUp passam sem custo.
-///  - Identidade vem do token; pedido para outro usuario nao e alterado.
-///  - Qualquer erro devolve a resposta original do Jellyfin.
+/// Projeto:
+///  - Filtro MVC singleton; trabalha com objetos, nunca com bytes (gzip/proxy nao interferem).
+///  - Fast path sincrono: pedido que nao e Resume/NextUp custa um teste de caractere e devolve next().
+///  - Paginacao exata (Wholphin/Moonfin paginam com startIndex+limit): pede ao Jellyfin so
+///    limite + duplicatas conhecidas, deduplica e devolve a janela pedida.
+///  - Uma consulta leve por usuario (sem DTOs), em cache de 2 s, compartilhada pelos dois endpoints.
+///  - Premissa verificada: o Jellyfin lista o Continue Watching do mais recente ao mais antigo. Toda resposta e conferida
+///    pela data de reproducao; se vier fora de ordem, o episodio mais recente assume a vaga e o plugin passa a ler a lista
+///    inteira (com aviso no log). Na ordem esperada nao custa nada alem de uma comparacao por item.
+///  - Qualquer falha devolve a resposta original; 5 falhas seguidas pausam o plugin por 10 min.
 /// </summary>
-public class ResumeDedupeFilter : IAsyncActionFilter
+public sealed class ResumeDedupeFilter(ILogger<ResumeDedupeFilter> log, IServiceProvider services)
+    : IAsyncActionFilter
 {
-    private const int Pad = 10;               // folga sobre o numero exato de remocoes
-    private const int FallbackFactor = 5;     // se a consulta direta falhar: heuristica antiga
-    private const int FallbackPad = 30;
-    private const int MaxFetch = 1000;        // teto de itens pedidos ao Jellyfin
+    private const int Pad = 10;               // folga do Continue Watching (itens Series/filmes fora da contagem)
+    private const int MaxFetch = 500;         // teto de itens pedidos ao Jellyfin
     private const int MaxScan = 2000;         // teto de episodios em andamento lidos por usuario
-    private const long CacheTtlMs = 2000;
-    private const long CacheMaxAgeMs = 60000;
-    private const int CachePruneAbove = 200;
+    private const int TripAfter = 5;
+    private const long TtlMs = 2_000;
+    private const long PauseMs = 600_000;
 
-    private static readonly ConcurrentDictionary<Guid, CacheEntry> Cache = new();
+    private static readonly ConcurrentDictionary<Guid, Entry> Cache = new();
 
-    private static int _loggedResume;
-    private static int _loggedNextUp;
-    private static int _loggedUnknownType;
-    private static int _loggedLoadFailure;
+    private static int _fails, _firstResume, _firstNextUp, _loggedLoad, _loggedType, _loggedNoUser, _unsorted;
+    private static long _pausedUntil;
 
-    private readonly ILogger<ResumeDedupeFilter> _logger;
-    private readonly ILibraryManager _library;
-    private readonly IUserManager _users;
-
-    public ResumeDedupeFilter(
-        ILogger<ResumeDedupeFilter> logger,
-        ILibraryManager libraryManager,
-        IUserManager userManager)
-    {
-        _logger = logger;
-        _library = libraryManager;
-        _users = userManager;
-    }
-
-    private enum Kind
+    private enum Kind : byte
     {
         None,
         Resume,
         NextUp
     }
 
-    /// <summary>Janela pedida pelo cliente, se a consulta foi ampliada e series a esconder.</summary>
-    private readonly record struct Plan(int Start, int? Limit, bool Applied, int Fetched, HashSet<Guid>? Hidden);
+    /// <summary>O que o cliente pediu e o que vamos esconder. Kind.None = nao mexer.</summary>
+    private readonly record struct Plan(Kind Kind, int Start, int? Limit, bool Widened, HashSet<Guid>? Hidden);
 
-    private sealed class CacheEntry
+    /// <summary>Series com episodio em andamento e quantos episodios sobram alem de um por serie.</summary>
+    private sealed record Info(HashSet<Guid> Series, int Extra);
+
+    private sealed class Entry(long at, Func<Info?> load)
     {
-        public CacheEntry(long at, Func<Dictionary<Guid, int>?> load)
-        {
-            At = at;
-            Counts = new Lazy<Dictionary<Guid, int>?>(load, LazyThreadSafetyMode.ExecutionAndPublication);
-        }
+        public long At { get; } = at;
 
-        public long At { get; }
-
-        /// <summary>Episodios em andamento por serie (null = nao foi possivel consultar).</summary>
-        public Lazy<Dictionary<Guid, int>?> Counts { get; }
+        public Lazy<Info?> Value { get; } = new(load, LazyThreadSafetyMode.ExecutionAndPublication);
     }
+
+    // ------------------------------------------------------------------ ENTRADA
 
     public Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
     {
-        // Filtro global: roda em TODA acao da API (imagens, HLS, etc.). Para tudo que nao e
-        // Resume/NextUp, devolve next() direto: sem maquina de estado async, sem alocacao.
-        Kind kind;
-        try
-        {
-            kind = Classify(context.HttpContext.Request);
-        }
-        catch
-        {
-            kind = Kind.None;
-        }
-
-        return kind == Kind.None ? next() : RunAsync(context, next, kind);
+        var kind = Classify(context.HttpContext.Request);
+        return kind == Kind.None || Environment.TickCount64 < Volatile.Read(ref _pausedUntil)
+            ? next()
+            : Run(context, next, kind);
     }
 
-    private async Task RunAsync(ActionExecutingContext context, ActionExecutionDelegate next, Kind kind)
+    private async Task Run(ActionExecutingContext context, ActionExecutionDelegate next, Kind kind)
     {
-        var plan = default(Plan);
-        var cfg = GetConfig();
-
+        Plan plan;
         try
         {
-            var enabled = kind == Kind.Resume
-                ? cfg.DedupeContinueWatching
-                : cfg.HideNextUpInContinueWatching;
-
-            if (!enabled
-                || (kind == Kind.Resume && !WantsEpisodes(context.HttpContext.Request))
-                || !TryGetUserId(context, out var userId))
-            {
-                kind = Kind.None;
-            }
-            else
-            {
-                plan = Prepare(context, kind, cfg, userId);
-            }
+            plan = Prepare(context, kind);
         }
         catch (Exception ex)
         {
-            kind = Kind.None;
+            Fail(ex, "falha ao preparar a consulta");
             plan = default;
-            _logger.LogWarning(ex, "ResumeDedupe: falha ao preparar a consulta; seguindo sem alterar");
         }
 
         var executed = await next().ConfigureAwait(false);
-
-        if (kind == Kind.None || executed.Exception is not null)
+        if (plan.Kind == Kind.None || executed.Exception is not null)
         {
             return;
         }
@@ -146,103 +97,113 @@ public class ResumeDedupeFilter : IAsyncActionFilter
         {
             if (executed.Result is ObjectResult { Value: QueryResult<BaseItemDto> result } holder)
             {
-                if (kind == Kind.Resume)
+                Reshape(holder, result, plan);
+                if (Volatile.Read(ref _fails) != 0)
                 {
-                    ProcessResume(holder, result, cfg, plan);
-                }
-                else
-                {
-                    ProcessNextUp(holder, result, plan);
+                    Interlocked.Exchange(ref _fails, 0);
                 }
             }
-            else if (Interlocked.Exchange(ref _loggedUnknownType, 1) == 0)
+            else if (Interlocked.Exchange(ref _loggedType, 1) == 0)
             {
-                _logger.LogWarning(
-                    "ResumeDedupe: tipo de resposta inesperado ({Type}) em {Path}; nada foi alterado",
-                    (executed.Result as ObjectResult)?.Value?.GetType().FullName ?? executed.Result?.GetType().FullName,
-                    context.HttpContext.Request.Path.Value);
+                log.LogWarning(
+                    "ResumeDedupe: resposta inesperada ({Type}); nada foi alterado",
+                    (executed.Result as ObjectResult)?.Value?.GetType().FullName ?? executed.Result?.GetType().FullName);
             }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "ResumeDedupe: falha ao processar; devolvendo resposta original");
-            TryTrim(executed, plan);
+            Fail(ex, "falha ao processar");
+            Trim(executed.Result, plan);
         }
     }
 
-    // ----------------------------------------------------------- PREPARACAO
+    // --------------------------------------------------------------- ANTES DA ACAO
 
     /// <summary>
-    /// Decide quantos itens pedir ao Jellyfin para que, depois de remover duplicatas,
-    /// a janela do cliente (startIndex/limit) continue cheia. So altera a consulta
-    /// quando ha algo a remover.
+    /// Decide o que esconder e, se o cliente pagina, amplia a consulta para que depois de remover
+    /// as duplicatas a janela (startIndex/limit) continue cheia.
     /// </summary>
-    private Plan Prepare(ActionExecutingContext context, Kind kind, PluginConfiguration cfg, Guid userId)
+    private Plan Prepare(ActionExecutingContext context, Kind kind)
     {
+        if (kind == Kind.Resume && !WantsVideo(context.HttpContext.Request.Query))
+        {
+            return default;
+        }
+
         var args = context.ActionArguments;
+
+        // A escolha do episodio mais recente usa a data de reproducao (UserData); se o cliente a desligou, religa.
+        if (kind == Kind.Resume && args.TryGetValue("enableUserData", out var userData) && userData is false)
+        {
+            args["enableUserData"] = true;
+        }
+
         var start = Math.Max(0, ReadInt(args, "startIndex") ?? 0);
         var limit = ReadInt(args, "limit");
-
-        if (kind == Kind.Resume && (limit is <= 0 || (start == 0 && limit is null)))
+        if (limit <= 0)
         {
-            return new Plan(start, limit, false, 0, null); // nada a ampliar: sem consulta extra
+            limit = null; // o Jellyfin trata 0 como "sem limite"
         }
 
-        var counts = userId == Guid.Empty ? null : GetResumeCounts(userId);
+        // Continue Watching de lista completa: so deduplicar. Nem precisa saber quem e o usuario.
+        if (kind == Kind.Resume && limit is null && start == 0)
+        {
+            return new Plan(kind, 0, null, false, null);
+        }
 
+        // Next Up precisa das series em andamento do usuario; Resume so as usa para dimensionar a ampliacao
+        // (sem usuario identificado ele ainda deduplica, com ampliacao estimada).
+        var hasUser = TryGetUser(context, out var user);
+        if (!hasUser && Interlocked.Exchange(ref _loggedNoUser, 1) == 0)
+        {
+            log.LogWarning("ResumeDedupe: usuario do pedido nao identificado (sem token ou userId diferente do token); Next Up nao sera filtrado");
+        }
+
+        var info = hasUser ? GetInfo(user) : null;
         HashSet<Guid>? hidden = null;
-        var removable = 0; // quantos itens, no maximo, serao removidos; -1 = desconhecido
-
         if (kind == Kind.NextUp)
         {
-            if (counts is { Count: > 0 })
+            hidden = info?.Series;
+            if (hidden is not { Count: > 0 })
             {
-                hidden = new HashSet<Guid>(counts.Keys);
-                removable = hidden.Count; // o Next Up traz no maximo 1 episodio por serie
-            }
-        }
-        else if (counts is null)
-        {
-            removable = -1;
-        }
-        else
-        {
-            var max = MaxPerSeries(cfg);
-            foreach (var count in counts.Values)
-            {
-                if (count > max)
-                {
-                    removable += count - max;
-                }
+                return default; // nada a esconder: o pedido passa intacto
             }
         }
 
-        if (limit is <= 0 || removable == 0 || (start == 0 && limit is null))
+        var plain = new Plan(kind, start, limit, false, hidden);
+        if (limit is null && start == 0)
         {
-            return new Plan(start, limit, false, 0, hidden);
+            return plain; // lista completa: nada a ampliar
+        }
+
+        // Quantos itens, no maximo, serao removidos (-1 = desconhecido).
+        var extra = kind == Kind.NextUp ? hidden!.Count : info?.Extra ?? -1;
+        if (extra == 0)
+        {
+            return plain;
         }
 
         if (limit is null)
         {
-            // Sem limite mas com offset: buscar tudo do inicio e cortar depois.
-            if (args.ContainsKey("startIndex"))
+            // Offset sem limite: buscar tudo do inicio e cortar depois.
+            if (!args.ContainsKey("startIndex"))
             {
-                args["startIndex"] = 0;
-                return new Plan(start, null, true, 0, hidden);
+                return plain;
             }
 
-            return new Plan(start, null, false, 0, hidden);
+            args["startIndex"] = 0;
+            return plain with { Widened = true };
         }
 
-        var needed = (long)start + limit.Value;
-        var wide = removable > 0
-            ? needed + removable + Pad
-            : Math.Max(needed * FallbackFactor, needed + FallbackPad);
-        wide = Math.Min(wide, MaxFetch);
-
-        if (wide < needed || !args.ContainsKey("limit"))
+        // Next Up: as series escondidas sao um limite exato (um item por serie), entao sem folga:
+        // o Jellyfin calcula o proximo episodio de cada serie pedida, e esse e o calculo mais caro.
+        var need = (long)start + limit.Value;
+        var wide = kind == Kind.Resume && Volatile.Read(ref _unsorted) != 0
+            ? MaxFetch // ordem nao confiavel: ler a lista inteira para escolher o episodio certo
+            : Math.Min(extra > 0 ? need + extra + (kind == Kind.NextUp ? 0 : Pad) : need * 4 + 30, MaxFetch);
+        if (wide < need || !args.ContainsKey("limit"))
         {
-            return new Plan(start, limit, false, 0, hidden); // pagina muito profunda: sem ampliar
+            return plain; // pagina muito funda: sem ampliar
         }
 
         args["limit"] = (int)wide;
@@ -251,43 +212,175 @@ public class ResumeDedupeFilter : IAsyncActionFilter
             args["startIndex"] = 0;
         }
 
-        return new Plan(start, limit, true, (int)wide, hidden);
+        return plain with { Widened = true };
     }
 
-    // ------------------------------------------------- CONSULTA DIRETA (CACHE)
+    // ------------------------------------------------------------------ DEPOIS DA ACAO
 
-    private Dictionary<Guid, int>? GetResumeCounts(Guid userId)
+    private void Reshape(ObjectResult holder, QueryResult<BaseItemDto> result, in Plan plan)
     {
-        var now = Environment.TickCount64;
-        if (Cache.TryGetValue(userId, out var hit) && now - hit.At <= CacheTtlMs)
+        var raw = result.Items as IReadOnlyList<BaseItemDto> ?? result.Items?.ToList() ?? new List<BaseItemDto>();
+        var kept = new List<BaseItemDto>(raw.Count);
+        var slots = plan.Kind == Kind.Resume ? new Dictionary<Guid, int>() : null;
+        DateTime? previous = null;
+
+        foreach (var item in raw)
         {
-            return hit.Counts.Value;
+            if (slots is null)
+            {
+                if (item.SeriesId is { } sid && plan.Hidden!.Contains(sid))
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                // Verifica a premissa (mais recente primeiro) em toda resposta, sem custo relevante.
+                if (item.UserData?.LastPlayedDate is { } played)
+                {
+                    if (previous is { } before && played > before)
+                    {
+                        NoteUnsorted();
+                    }
+
+                    previous = played;
+                }
+
+                var key = KeyOf(item);
+                if (key != Guid.Empty)
+                {
+                    if (slots.TryGetValue(key, out var slot))
+                    {
+                        // Ja temos esta serie. Normalmente o primeiro e o mais recente (o Jellyfin ordena por data
+                        // de reproducao); se a data disser o contrario, o mais recente assume a vaga.
+                        if (IsNewer(item, kept[slot]))
+                        {
+                            kept[slot] = item;
+                            NoteUnsorted();
+                        }
+
+                        continue;
+                    }
+
+                    slots[key] = kept.Count;
+                }
+            }
+
+            kept.Add(item);
         }
 
-        var entry = Cache.AddOrUpdate(
-            userId,
-            _ => new CacheEntry(now, () => LoadResumeCounts(userId)),
-            (_, old) => now - old.At > CacheTtlMs ? new CacheEntry(now, () => LoadResumeCounts(userId)) : old);
-
-        // Count de ConcurrentDictionary e caro: so consultamos ao criar/renovar uma entrada.
-        if (Cache.Count > CachePruneAbove)
+        var removed = raw.Count - kept.Count;
+        if (removed == 0 && !plan.Widened)
         {
-            Prune(now);
+            return; // nada mudou
         }
 
-        return entry.Counts.Value;
+        var page = kept;
+        if (plan.Widened)
+        {
+            var skip = Math.Min(plan.Start, kept.Count);
+            page = kept.GetRange(skip, Math.Min(plan.Limit ?? int.MaxValue, kept.Count - skip));
+        }
+
+        // Total estimado: o total do servidor menos o que removemos (exato se buscamos tudo).
+        var original = result.TotalRecordCount;
+        var total = original > 0
+            ? Math.Max(original - removed, (plan.Widened ? plan.Start : 0) + page.Count)
+            : original;
+
+        if (removed > 0)
+        {
+            Hit(plan.Kind, raw.Count, page.Count);
+        }
+
+        holder.Value = new QueryResult<BaseItemDto>(plan.Widened ? plan.Start : result.StartIndex, total, page);
     }
+
+    /// <summary>Se algo falhar depois de ampliar a consulta, devolve ao menos a janela original.</summary>
+    private static void Trim(IActionResult? result, in Plan plan)
+    {
+        if (!plan.Widened || result is not ObjectResult { Value: QueryResult<BaseItemDto> r } holder)
+        {
+            return;
+        }
+
+        try
+        {
+            var items = (r.Items ?? Array.Empty<BaseItemDto>())
+                .Skip(plan.Start)
+                .Take(plan.Limit ?? int.MaxValue)
+                .ToList();
+            holder.Value = new QueryResult<BaseItemDto>(plan.Start, r.TotalRecordCount, items);
+        }
+        catch
+        {
+            // Ultimo recurso: nada a fazer.
+        }
+    }
+
+    private static bool IsNewer(BaseItemDto candidate, BaseItemDto current)
+        => candidate.UserData?.LastPlayedDate is { } a && current.UserData?.LastPlayedDate is { } b && a > b;
 
     /// <summary>
-    /// Mesma consulta que o Jellyfin usa para Continue Watching, mas leve (sem DTOs):
-    /// conta os episodios em andamento por serie.
+    /// O Continue Watching veio fora da ordem de reproducao: a premissa do plugin falhou. Dai em diante
+    /// le a lista inteira (ate MaxFetch) para sempre escolher o episodio mais recente de cada serie.
     /// </summary>
-    private Dictionary<Guid, int>? LoadResumeCounts(Guid userId)
+    private void NoteUnsorted()
+    {
+        if (Interlocked.Exchange(ref _unsorted, 1) == 0)
+        {
+            log.LogWarning("ResumeDedupe: o Continue Watching veio fora da ordem de reproducao; lendo a lista inteira e usando a data de reproducao.");
+        }
+    }
+
+    /// <summary>Episodio/temporada contam para a serie; um item Series (Jellyfin 12.2+) conta para si mesmo.</summary>
+    private static Guid KeyOf(BaseItemDto item) => item.Type switch
+    {
+        BaseItemKind.Episode or BaseItemKind.Season => item.SeriesId ?? Guid.Empty,
+        BaseItemKind.Series => item.Id,
+        _ => Guid.Empty
+    };
+
+    // ----------------------------------------------------------- CONSULTA DIRETA
+
+    private Info? GetInfo(Guid user)
+    {
+        var now = Environment.TickCount64;
+        return Cache.TryGetValue(user, out var entry) && now - entry.At <= TtlMs
+            ? entry.Value.Value
+            : Refresh(user, now);
+    }
+
+    // Separado de GetInfo para que o caminho de acerto do cache nao aloque closures.
+    private Info? Refresh(Guid user, long now)
+    {
+        var entry = Cache.AddOrUpdate(
+            user,
+            _ => new Entry(now, () => Load(user)),
+            (_, old) => now - old.At > TtlMs ? new Entry(now, () => Load(user)) : old);
+
+        if (Cache.Count > 64)
+        {
+            foreach (var (key, stale) in Cache)
+            {
+                if (now - stale.At > 60_000)
+                {
+                    Cache.TryRemove(key, out _);
+                }
+            }
+        }
+
+        return entry.Value.Value;
+    }
+
+    /// <summary>Mesma consulta do Continue Watching, mas sem DTOs: so as series e a contagem.</summary>
+    private Info? Load(Guid userId)
     {
         try
         {
-            var user = _users.GetUserById(userId);
-            if (user is null)
+            var library = services.GetService<ILibraryManager>();
+            var user = services.GetService<IUserManager>()?.GetUserById(userId);
+            if (library is null || user is null)
             {
                 return null;
             }
@@ -296,7 +389,7 @@ public class ResumeDedupeFilter : IAsyncActionFilter
             {
                 IsResumable = true,
                 Recursive = true,
-                IncludeItemTypes = new[] { BaseItemKind.Episode },
+                IncludeItemTypes = [BaseItemKind.Episode],
                 IsVirtualItem = false,
                 CollapseBoxSetItems = false,
                 IncludeOwnedItems = true,
@@ -305,324 +398,98 @@ public class ResumeDedupeFilter : IAsyncActionFilter
                 Limit = MaxScan
             };
 
-            var counts = new Dictionary<Guid, int>();
-            foreach (var item in _library.GetItemList(query))
+            var series = new HashSet<Guid>();
+            var extra = 0;
+            foreach (var item in library.GetItemList(query))
             {
-                if (item is Episode episode && episode.SeriesId != Guid.Empty)
+                if (item is Episode { SeriesId: var id } && id != Guid.Empty && !series.Add(id))
                 {
-                    counts.TryGetValue(episode.SeriesId, out var current);
-                    counts[episode.SeriesId] = current + 1;
+                    extra++;
                 }
             }
 
-            return counts;
+            return new Info(series, extra);
         }
         catch (Exception ex)
         {
-            if (Interlocked.Exchange(ref _loggedLoadFailure, 1) == 0)
+            if (Interlocked.Exchange(ref _loggedLoad, 1) == 0)
             {
-                _logger.LogWarning(ex, "ResumeDedupe: nao foi possivel consultar os episodios em andamento; usando modo reduzido");
+                log.LogWarning(ex, "ResumeDedupe: nao foi possivel consultar os episodios em andamento; modo reduzido");
             }
 
             return null;
         }
     }
 
-    private static void Prune(long now)
+    // --------------------------------------------------------------------- APOIO
+
+    private static Kind Classify(HttpRequest request)
     {
-        foreach (var pair in Cache)
+        var path = request.Path.Value;
+        if (path is null || path.Length < 13)
         {
-            if (now - pair.Value.At > CacheMaxAgeMs)
-            {
-                Cache.TryRemove(pair.Key, out _);
-            }
+            return Kind.None;
         }
 
-        if (Cache.Count > CachePruneAbove * 4)
+        // Quase todo pedido da API acaba aqui: so rotas terminadas em "e" (Resume) ou "p" (NextUp) seguem.
+        switch (path[^1] | 0x20)
         {
-            Cache.Clear(); // teto duro: o cache e so uma otimizacao, pode recomecar
+            case 'e' when path.EndsWith("/Items/Resume", StringComparison.OrdinalIgnoreCase)
+                       || path.EndsWith("/UserItems/Resume", StringComparison.OrdinalIgnoreCase):
+                return Kind.Resume;
+
+            // Next Up de uma serie especifica (pagina da serie) nao entra.
+            case 'p' when path.EndsWith("/Shows/NextUp", StringComparison.OrdinalIgnoreCase)
+                       && !request.Query.ContainsKey("seriesId"):
+                return Kind.NextUp;
+
+            default:
+                return Kind.None;
         }
     }
 
     /// <summary>
-    /// Resume de audio/livros (mediaTypes sem Video), so filmes, ou busca: nao ha o que deduplicar por serie.
-    /// Pular evita ampliar a consulta e a consulta de contagem a toa.
+    /// Usuario do pedido. O token manda; se o pedido nomeia outro usuario (admin vendo outra conta)
+    /// nao mexemos. Com chave de API (sem token de usuario) vale o userId do pedido.
     /// </summary>
-    private static bool WantsEpisodes(HttpRequest request)
+    private static bool TryGetUser(ActionExecutingContext context, out Guid user)
     {
-        var query = request.Query;
+        var asked = context.ActionArguments.TryGetValue("userId", out var arg) && arg is Guid g ? g : Guid.Empty;
 
-        if (query.TryGetValue("searchTerm", out var term) && HasAny(term))
+        if (Guid.TryParse(context.HttpContext.User.FindFirst("Jellyfin-UserId")?.Value, out var self) && self != Guid.Empty)
         {
-            return false;
+            user = self;
+            return asked == Guid.Empty || asked == self;
         }
 
-        if (query.TryGetValue("mediaTypes", out var media) && HasAny(media) && !Mentions(media, "Video"))
-        {
-            return false;
-        }
-
-        if (query.TryGetValue("includeItemTypes", out var include) && HasAny(include)
-            && !Mentions(include, "Episode") && !Mentions(include, "Series") && !Mentions(include, "Season"))
-        {
-            return false;
-        }
-
-        return !(query.TryGetValue("excludeItemTypes", out var exclude) && Mentions(exclude, "Episode"));
+        user = asked;
+        return asked != Guid.Empty;
     }
 
-    private static bool HasAny(StringValues values)
+    /// <summary>Continue Listening/Reading (mediaTypes sem Video) nao tem episodios a deduplicar.</summary>
+    private static bool WantsVideo(IQueryCollection query)
     {
-        foreach (var value in values)
+        if (!query.TryGetValue("mediaTypes", out var media))
         {
-            if (!string.IsNullOrWhiteSpace(value))
+            return true;
+        }
+
+        var any = false;
+        foreach (var value in media)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                continue;
+            }
+
+            any = true;
+            if (value.Contains("Video", StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
         }
 
-        return false;
-    }
-
-    private static bool Mentions(StringValues values, string token)
-    {
-        foreach (var value in values)
-        {
-            if (value is not null && value.Contains(token, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static int MaxPerSeries(PluginConfiguration cfg) => Math.Clamp(cfg.MaxEpisodesPerSeries, 1, 10);
-
-    // -------------------------------------------------------- CONTINUE WATCHING
-
-    private void ProcessResume(ObjectResult holder, QueryResult<BaseItemDto> result, PluginConfiguration cfg, Plan plan)
-    {
-        var raw = result.Items?.ToList() ?? new List<BaseItemDto>();
-        var deduped = Dedupe(raw, MaxPerSeries(cfg));
-        var page = Slice(deduped, plan);
-
-        Publish(holder, result, raw.Count, deduped.Count, page, plan);
-
-        if (deduped.Count != raw.Count && Interlocked.Exchange(ref _loggedResume, 1) == 0)
-        {
-            _logger.LogInformation(
-                "ResumeDedupe: Continue Watching deduplicado ({Before} -> {After} itens). Funcionando.",
-                raw.Count,
-                deduped.Count);
-        }
-    }
-
-    // ------------------------------------------------------------------ NEXT UP
-
-    private void ProcessNextUp(ObjectResult holder, QueryResult<BaseItemDto> result, Plan plan)
-    {
-        var raw = result.Items?.ToList() ?? new List<BaseItemDto>();
-        var items = raw;
-
-        if (plan.Hidden is { Count: > 0 } hidden)
-        {
-            items = raw.Where(i => !InSet(i, hidden)).ToList();
-        }
-
-        var deduped = Dedupe(items, 1);
-        var page = Slice(deduped, plan);
-
-        Publish(holder, result, raw.Count, deduped.Count, page, plan);
-
-        if (deduped.Count != raw.Count && Interlocked.Exchange(ref _loggedNextUp, 1) == 0)
-        {
-            _logger.LogInformation(
-                "ResumeDedupe: Next Up filtrado ({Before} -> {After} itens). Funcionando.",
-                raw.Count,
-                deduped.Count);
-        }
-    }
-
-    // ------------------------------------------------------------------ HELPERS
-
-    private static bool InSet(BaseItemDto item, HashSet<Guid> set)
-    {
-        if (item.SeriesId is { } seriesId)
-        {
-            return set.Contains(seriesId);
-        }
-
-        return false;
-    }
-
-    /// <summary>Chave da serie a que o item pertence (Guid.Empty = nao agrupa: filmes, musicas...).</summary>
-    private static Guid KeyOf(BaseItemDto item)
-    {
-        // Episodio/temporada contam para a sua serie; um item "Series" (o Jellyfin 12.x pode devolver
-        // a serie inteira em Continue Watching) conta para ela mesma.
-        if (item.Type is BaseItemKind.Episode or BaseItemKind.Season
-            && item.SeriesId is { } seriesId && seriesId != Guid.Empty)
-        {
-            return seriesId;
-        }
-
-        return item.Type == BaseItemKind.Series ? item.Id : Guid.Empty;
-    }
-
-    private static List<BaseItemDto> Dedupe(IEnumerable<BaseItemDto> items, int maxPerSeries)
-    {
-        var ids = new HashSet<Guid>();
-        var counts = new Dictionary<Guid, int>();
-        var kept = new List<BaseItemDto>();
-
-        foreach (var item in items)
-        {
-            if (item is null)
-            {
-                continue;
-            }
-
-            // Mesmo item repetido na lista.
-            if (item.Id != Guid.Empty && !ids.Add(item.Id))
-            {
-                continue;
-            }
-
-            var key = KeyOf(item);
-            if (key != Guid.Empty)
-            {
-                counts.TryGetValue(key, out var count);
-                if (count >= maxPerSeries)
-                {
-                    // O Jellyfin ja ordena por data de reproducao; isto so protege se a ordem vier diferente.
-                    TryPromote(kept, key, item);
-                    continue;
-                }
-
-                counts[key] = count + 1;
-            }
-
-            kept.Add(item);
-        }
-
-        return kept;
-    }
-
-    /// <summary>Se o item descartado foi reproduzido depois de um mantido da mesma serie, troca os dois.</summary>
-    private static void TryPromote(List<BaseItemDto> kept, Guid key, BaseItemDto item)
-    {
-        if (item.UserData?.LastPlayedDate is not { } newer)
-        {
-            return;
-        }
-
-        var worst = -1;
-        var worstDate = DateTime.MaxValue;
-        for (var i = 0; i < kept.Count; i++)
-        {
-            if (KeyOf(kept[i]) != key)
-            {
-                continue;
-            }
-
-            var date = kept[i].UserData?.LastPlayedDate ?? DateTime.MinValue;
-            if (date < worstDate)
-            {
-                worstDate = date;
-                worst = i;
-            }
-        }
-
-        if (worst >= 0 && newer > worstDate)
-        {
-            kept[worst] = item;
-        }
-    }
-
-    private static List<BaseItemDto> Slice(List<BaseItemDto> deduped, Plan plan)
-    {
-        if (!plan.Applied)
-        {
-            // Sem ampliacao: a lista recebida ja e a janela do cliente.
-            return deduped;
-        }
-
-        IEnumerable<BaseItemDto> query = deduped.Skip(plan.Start);
-        if (plan.Limit.HasValue)
-        {
-            query = query.Take(plan.Limit.Value);
-        }
-
-        return query.ToList();
-    }
-
-    /// <summary>Troca o resultado por um novo QueryResult com a janela filtrada e o total ajustado.</summary>
-    private static void Publish(
-        ObjectResult holder,
-        QueryResult<BaseItemDto> original,
-        int rawCount,
-        int dedupedCount,
-        List<BaseItemDto> page,
-        Plan plan)
-    {
-        if (!plan.Applied && page.Count == rawCount)
-        {
-            return; // nada mudou
-        }
-
-        var originalTotal = original.TotalRecordCount;
-        int total;
-
-        if (originalTotal <= 0)
-        {
-            total = originalTotal; // o cliente nao pediu total
-        }
-        else if (plan.Applied)
-        {
-            // Buscamos do inicio: se o Jellyfin devolveu menos que o pedido, temos tudo.
-            var fetchedAll = plan.Fetched == 0 || rawCount < plan.Fetched;
-            total = fetchedAll
-                ? dedupedCount
-                : dedupedCount + Math.Max(0, originalTotal - rawCount);
-        }
-        else if (plan.Start == 0 && plan.Limit is null)
-        {
-            total = dedupedCount; // lista completa
-        }
-        else
-        {
-            // Pagina isolada (sem ampliar): estimativa pelo que foi removido.
-            total = Math.Max(dedupedCount, originalTotal - (rawCount - dedupedCount));
-        }
-
-        var startIndex = plan.Applied ? plan.Start : original.StartIndex;
-        holder.Value = new QueryResult<BaseItemDto>(startIndex, total, page);
-    }
-
-    /// <summary>Se algo falhar depois de ampliar a consulta, devolve ao menos a janela original.</summary>
-    private static void TryTrim(ActionExecutedContext executed, Plan plan)
-    {
-        try
-        {
-            if (!plan.Applied)
-            {
-                return;
-            }
-
-            if (executed.Result is ObjectResult { Value: QueryResult<BaseItemDto> result } holder)
-            {
-                var list = (result.Items ?? Array.Empty<BaseItemDto>())
-                    .Skip(plan.Start)
-                    .Take(plan.Limit ?? int.MaxValue)
-                    .ToList();
-                holder.Value = new QueryResult<BaseItemDto>(plan.Start, result.TotalRecordCount, list);
-            }
-        }
-        catch
-        {
-            // Ultimo recurso: nada a fazer.
-        }
+        return !any;
     }
 
     private static int? ReadInt(IDictionary<string, object?> args, string key)
@@ -640,76 +507,24 @@ public class ResumeDedupeFilter : IAsyncActionFilter
         };
     }
 
-    private static Kind Classify(HttpRequest request)
+    private void Hit(Kind kind, int before, int after)
     {
-        var path = request.Path.Value;
-        if (string.IsNullOrEmpty(path))
+        if (Interlocked.Exchange(ref (kind == Kind.Resume ? ref _firstResume : ref _firstNextUp), 1) == 0)
         {
-            return Kind.None;
+            log.LogInformation("ResumeDedupe: {Kind} filtrado ({Before} -> {After} itens). Funcionando.", kind, before, after);
         }
-
-        // Quase todo pedido da API termina aqui na primeira checagem.
-        if (path.EndsWith("/Resume", StringComparison.OrdinalIgnoreCase)
-            && (path.EndsWith("/Items/Resume", StringComparison.OrdinalIgnoreCase)
-                || path.EndsWith("/UserItems/Resume", StringComparison.OrdinalIgnoreCase)))
-        {
-            return Kind.Resume;
-        }
-
-        // Next Up de uma serie especifica (pagina da serie) nao entra.
-        if (path.EndsWith("/NextUp", StringComparison.OrdinalIgnoreCase)
-            && path.EndsWith("/Shows/NextUp", StringComparison.OrdinalIgnoreCase)
-            && !request.Query.ContainsKey("seriesId"))
-        {
-            return Kind.NextUp;
-        }
-
-        return Kind.None;
     }
 
-    /// <summary>
-    /// Usuario cujo pedido estamos ajustando. O token autenticado manda; se o pedido nomeia outro
-    /// usuario (admin vendo outra conta), nao mexemos. Com chave de API (sem claim) vale o userId do pedido.
-    /// </summary>
-    private static bool TryGetUserId(ActionExecutingContext context, out Guid userId)
+    private void Fail(Exception ex, string what)
     {
-        var http = context.HttpContext;
-        _ = Guid.TryParse(http.User.FindFirst("Jellyfin-UserId")?.Value, out var claim);
-
-        Guid requested = Guid.Empty;
-        if (context.ActionArguments.TryGetValue("userId", out var arg))
+        log.LogWarning(ex, "ResumeDedupe: {What}; resposta original mantida", what);
+        if (Interlocked.Increment(ref _fails) < TripAfter)
         {
-            requested = ToGuid(arg);
+            return;
         }
 
-        if (requested == Guid.Empty)
-        {
-            requested = ToGuid(http.Request.RouteValues["userId"]);
-        }
-
-        if (requested == Guid.Empty && http.Request.Query.TryGetValue("userId", out var q))
-        {
-            requested = ToGuid(q.FirstOrDefault());
-        }
-
-        if (claim != Guid.Empty)
-        {
-            userId = claim;
-            return requested == Guid.Empty || requested == claim;
-        }
-
-        userId = requested;
-        return requested != Guid.Empty;
+        Interlocked.Exchange(ref _fails, 0);
+        Volatile.Write(ref _pausedUntil, Environment.TickCount64 + PauseMs);
+        log.LogError("ResumeDedupe: falhas repetidas; pausado por 10 minutos (a API do Jellyfin segue normal)");
     }
-
-    private static Guid ToGuid(object? value) => value switch
-    {
-        Guid g => g,
-        string s when Guid.TryParse(s, out var parsed) => parsed,
-        null => Guid.Empty,
-        _ => Guid.TryParse(value.ToString(), out var other) ? other : Guid.Empty
-    };
-
-    private static PluginConfiguration GetConfig()
-        => Plugin.Instance?.Configuration ?? new PluginConfiguration();
 }
