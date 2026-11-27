@@ -1,0 +1,14 @@
+{
+  "category": "General",
+  "guid": "7c1d9f4e-2b6a-4e0f-9a53-3d8b1c5e7a21",
+  "name": "Resume Dedupe",
+  "description": "Um episodio por serie em Continuar Assistindo e sem repetir essas series no Next Up. Server-side: funciona em Moonfin, Wholphin, AFinity e demais clientes.",
+  "overview": "Deduplica Continue Watching e Next Up no servidor.",
+  "owner": "local",
+  "targetAbi": "12.0.0.0",
+  "timestamp": "2026-11-26T00:00:00Z",
+  "version": "3.0.3.0",
+  "status": "Active",
+  "autoUpdate": false,
+  "assemblies": [ "Jellyfin.Plugin.ResumeDedupe.dll" ]
+}
